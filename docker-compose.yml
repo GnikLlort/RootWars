@@ -1,0 +1,119 @@
+version: '3.9'
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: rootwars
+      POSTGRES_PASSWORD: rootwars_dev_password
+      POSTGRES_DB: rootwars
+    ports:
+      - '5432:5432'
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./migrations/001_initial_schema.sql:/docker-entrypoint-initdb.d/001_initial_schema.sql:ro
+    networks:
+      - app_net
+    healthcheck:
+      test: ['CMD-SHELL', 'pg_isready -U rootwars -d rootwars']
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    ports:
+      - '6379:6379'
+    networks:
+      - app_net
+    healthcheck:
+      test: ['CMD', 'redis-cli', 'ping']
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile.api
+    restart: unless-stopped
+    ports:
+      - '3000:3000'
+    environment:
+      NODE_ENV: production
+      PORT: 3000
+      HOST: 0.0.0.0
+      DATABASE_URL: postgresql://rootwars:rootwars_dev_password@postgres:5432/rootwars
+      REDIS_URL: redis://redis:6379
+      SESSION_SECRET: docker-compose-dev-secret-change-in-prod
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    networks:
+      - app_net
+
+  lab-worker:
+    build:
+      context: .
+      dockerfile: Dockerfile.worker
+    user: '65534:65534'
+    read_only: true
+    tmpfs:
+      - /tmp:size=32M,noexec,nosuid,nodev
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    deploy:
+      resources:
+        limits:
+          cpus: '0.50'
+          memory: 256M
+    environment:
+      NODE_ENV: production
+      DATABASE_URL: postgresql://rootwars:rootwars_dev_password@postgres:5432/rootwars
+      REDIS_URL: redis://redis:6379
+      LAB_SUBNET_PREFIX: '10.240'
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks:
+      - app_net
+      - lab_internal_net
+
+  lab-target-sovereign:
+    build:
+      context: .
+      dockerfile: Dockerfile.worker
+    command: ['node', '-e', "require('net').createServer(s=>{s.write('SSH-2.0-OpenSSH_9.2p1 SovereignBank\\r\\n');s.end();}).listen(2222,'0.0.0.0')"]
+    user: '65534:65534'
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    deploy:
+      resources:
+        limits:
+          cpus: '0.25'
+          memory: 128M
+    networks:
+      lab_internal_net:
+        ipv4_address: 10.240.10.10
+
+networks:
+  app_net:
+    driver: bridge
+  lab_internal_net:
+    driver: bridge
+    internal: true
+    ipam:
+      config:
+        - subnet: 10.240.0.0/16
+
+volumes:
+  pgdata:

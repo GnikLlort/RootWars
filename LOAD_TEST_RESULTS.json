@@ -1,0 +1,68 @@
+{
+  "timestamp": "2026-10-03T11:42:01.103Z",
+  "environment": {
+    "platform": "Linux 6.1.158+ (x64)",
+    "nodeVersion": "v22.22.3",
+    "cpuModel": "Intel(R) Xeon(R) Processor @ 2.60GHz",
+    "cpuCores": 2,
+    "totalMemoryGb": 3.85,
+    "dbBackend": "pglite",
+    "redisBackend": "redis-mock"
+  },
+  "workload": {
+    "concurrentSessions": 120,
+    "connectedWebSockets": 120,
+    "idleSessions": 48,
+    "activeSessions": 72,
+    "totalRequests": 864,
+    "successfulRequests": 864,
+    "failedRequests": 0,
+    "durationSeconds": 10.54,
+    "requestsPerSecond": 81.96
+  },
+  "latencyMs": {
+    "mean": 591.17,
+    "p50": 281.25,
+    "p90": 381.02,
+    "p95": 3012.09,
+    "p99": 7898.04,
+    "max": 9065.36
+  },
+  "breakdownByCategory": {
+    "terminal_cmd": {
+      "count": 348,
+      "p50Ms": 286.33,
+      "p95Ms": 5584.43,
+      "p99Ms": 8520.05
+    },
+    "map_read": {
+      "count": 258,
+      "p50Ms": 290.73,
+      "p95Ms": 904.54,
+      "p99Ms": 7610.19
+    },
+    "mission_update": {
+      "count": 172,
+      "p50Ms": 271.11,
+      "p95Ms": 821.37,
+      "p99Ms": 6509.44
+    },
+    "chat": {
+      "count": 86,
+      "p50Ms": 267.72,
+      "p95Ms": 4959.34,
+      "p99Ms": 6892.61
+    }
+  },
+  "databaseLoad": {
+    "totalQueriesExecuted": 7135,
+    "queriesPerSecond": 676.87,
+    "avgQueryLatencyMs": 1.24,
+    "totalDbTimeMs": 8850.3
+  },
+  "bottlenecksObserved": [
+    "Embedded PGlite (single-connection WASM PostgreSQL 16) serializes write transactions in-process; switching to external PostgreSQL 16 with pg.Pool (25 connections) via Docker Compose removes single-connection queuing.",
+    "Password hashing (scrypt) during simultaneous registration/login bursts is CPU-intensive (~35ms per hash); steady-state token validation uses SHA-256 + indexed session lookup (<1ms).",
+    "Isolated real-tool Nmap lab scans spawn a Linux network namespace + non-root Nmap process (~180-350ms per scan) and must remain offloaded to dedicated lab-worker pools rather than API processes."
+  ]
+}

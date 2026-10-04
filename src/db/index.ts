@@ -12,11 +12,27 @@ export interface DbClient {
   query<T = Record<string, any>>(sql: string, params?: any[]): Promise<QueryResult<T>>;
 }
 
+export interface DbPoolStats {
+  backend: 'pg' | 'pglite';
+  /** Connections currently checked out of the pool. */
+  total: number;
+  /** Connections sitting idle in the pool. */
+  idle: number;
+  /** Requests queued waiting for a connection (pool saturation signal). */
+  waiting: number;
+  /** Configured pool size. */
+  max: number;
+  /** True when the backend serializes all writes through a single connection. */
+  serialized: boolean;
+}
+
 export interface DatabaseAdapter extends DbClient {
   backendType: 'pg' | 'pglite';
   transaction<T>(fn: (tx: DbClient) => Promise<T>): Promise<T>;
   execSql(sql: string): Promise<void>;
   close(): Promise<void>;
+  /** Live connection-pool statistics, used by the load-test harness. */
+  poolStats(): DbPoolStats;
 }
 
 class PgPoolAdapter implements DatabaseAdapter {
@@ -65,6 +81,17 @@ class PgPoolAdapter implements DatabaseAdapter {
     } finally {
       client.release();
     }
+  }
+
+  poolStats(): DbPoolStats {
+    return {
+      backend: 'pg',
+      total: this.pool.totalCount,
+      idle: this.pool.idleCount,
+      waiting: this.pool.waitingCount,
+      max: 25,
+      serialized: false
+    };
   }
 
   async close(): Promise<void> {
@@ -122,6 +149,12 @@ class PGliteAdapter implements DatabaseAdapter {
     return next;
   }
 
+  poolStats(): DbPoolStats {
+    // PGlite exposes a single embedded PostgreSQL connection: every query is
+    // serialized, which is exactly the saturation signal reported by the load test.
+    return { backend: 'pglite', total: 1, idle: 0, waiting: 0, max: 1, serialized: true };
+  }
+
   async close(): Promise<void> {
     await this.pg.close();
   }
@@ -141,8 +174,20 @@ export async function createDatabase(options?: {
       const adapter = new PgPoolAdapter(dbUrl);
       await adapter.query('SELECT 1');
       return adapter;
-    } catch {
-      // Fallback to persistent PGlite (embedded PostgreSQL 16 engine) when external postgres daemon is not running
+    } catch (err: any) {
+      // Production must never silently run on an embedded, instance-local database:
+      // that would hide a broken deployment and split game state across containers.
+      if (process.env.NODE_ENV === 'production') {
+        throw new Error(
+          `FATAL: DATABASE_URL is configured but PostgreSQL is unreachable (${String(err?.message ?? err).trim()}). ` +
+            'Production never falls back to embedded PGlite; fix the database connection or unset NODE_ENV=production.'
+        );
+      }
+      // Development/test fallback to persistent PGlite (embedded PostgreSQL 16 engine).
+      console.warn(
+        `[RootWars DB] PostgreSQL at DATABASE_URL is unreachable (${String(err?.message ?? err).trim()}). ` +
+          'Falling back to embedded PGlite for local development.'
+      );
     }
   }
 

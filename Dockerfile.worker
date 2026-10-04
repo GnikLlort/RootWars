@@ -1,16 +1,22 @@
+# RootWars worker image: durable outbox/world work + lab scan orchestration.
+#
+# The worker talks to a DEDICATED lab Docker daemon (LAB_DOCKER_HOST, e.g.
+# tcp://lab-dind:2376 with TLS) and never mounts the host Docker socket. Only the
+# docker CLI client is present here; nmap itself lives inside the lab scanner image
+# that this worker launches on the lab daemon.
 FROM node:22-bookworm-slim
 
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    nmap \
-    iproute2 \
-    util-linux \
-    && rm -rf /var/lib/apt/lists/*
+# Pin the docker CLI from the official CLI image (client only, no daemon).
+COPY --from=docker:27.3.1-cli /usr/local/bin/docker /usr/local/bin/docker
 
 WORKDIR /app
 COPY package*.json ./
 RUN npm ci
 
 COPY . .
+RUN npm run build
 
 USER 65534:65534
-CMD ["npm", "run", "dev:worker"]
+ENV NODE_ENV=production \
+    ROLE=worker
+CMD ["node", "dist/server/workers/index.js"]

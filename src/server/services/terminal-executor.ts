@@ -12,8 +12,8 @@ import {
   getUserAccountId
 } from './ledger.js';
 import { executeDefenseAction, executePvpOperation } from './pvp.js';
-import { executeIsolatedLabScan } from '../../workers/lab-runner.js';
-import { enqueueOutboxJob, processPendingOutboxJobs } from '../../workers/outbox-worker.js';
+import type { LabScanResult } from '../../workers/lab-runner.js';
+import { enqueueOutboxJob } from '../../workers/outbox-worker.js';
 
 export interface TerminalExecutionOutput {
   ok: boolean;
@@ -29,6 +29,55 @@ export interface TerminalExecutionOutput {
     rewardXp: number;
   };
   data?: Record<string, any>;
+}
+
+/**
+ * Dispatches a lab scan to the durable outbox and waits for a lab worker to
+ * complete it.
+ *
+ * The API process deliberately does NOT execute docker/nmap itself: scans run in
+ * a worker process that owns the dedicated lab Docker endpoint. If no worker is
+ * available the command fails closed with an explicit explanation rather than
+ * pretending the scan happened.
+ */
+async function dispatchLabScanToWorker(
+  db: DatabaseAdapter,
+  scanRequest: {
+    tool: 'nmap';
+    profile: any;
+    missionId: string;
+    missionCode: string;
+    targetIp: string;
+    assignedTargetIp: string;
+    services: any[];
+  },
+  waitMs = Number(process.env.LAB_SCAN_WAIT_MS ?? 20000)
+): Promise<{ status: 'completed'; result: LabScanResult } | { status: 'failed' | 'timeout'; reason: string }> {
+  const jobId = await enqueueOutboxJob(db, 'lab_scan', { scanRequest });
+  const deadline = Date.now() + waitMs;
+
+  while (Date.now() < deadline) {
+    await new Promise((r) => setTimeout(r, 150));
+    const jobRes = await db.query<any>(
+      `SELECT status, result_json, error_message FROM outbox_jobs WHERE id = $1`,
+      [jobId]
+    );
+    const job = jobRes.rows[0];
+    if (!job) {
+      return { status: 'failed', reason: 'Lab scan job disappeared before completion.' };
+    }
+    if (job.status === 'completed') {
+      return { status: 'completed', result: (job.result_json ?? {}) as LabScanResult };
+    }
+    if (job.status === 'failed') {
+      return { status: 'failed', reason: String(job.error_message ?? 'lab scan job failed') };
+    }
+  }
+
+  return {
+    status: 'timeout',
+    reason: `Lab scan job ${jobId} was queued but no lab worker completed it within ${waitMs}ms.`
+  };
 }
 
 export async function executeUserTerminalCommand(
@@ -336,9 +385,12 @@ export async function executeUserTerminalCommand(
       const adjIds: string[] = Array.isArray(node.adjacent_nodes) ? node.adjacent_nodes : [];
       const newlyDiscovered: string[] = [];
       for (const adjId of adjIds) {
+        // FK-safe: only discover adjacency entries that still exist as nodes. A
+        // stale/removed reference (for example a player node in a non-demo world)
+        // must never fail the whole inspect command.
         const ins = await db.query(
           `INSERT INTO player_node_discoveries (user_id, node_id, discovery_source, inspected)
-           VALUES ($1, $2, 'scan', FALSE)
+           SELECT $1, n.id, 'scan', FALSE FROM network_nodes n WHERE n.id = $2
            ON CONFLICT (user_id, node_id) DO NOTHING
            RETURNING node_id`,
           [userId, adjId]
@@ -402,7 +454,6 @@ export async function executeUserTerminalCommand(
           triggerUserId: userId,
           triggerReason: `node inspection on ${node.hostname} by ${user.username}`
         });
-        await processPendingOutboxJobs(db, 'inline-worker', 2);
       }
 
       const services: Array<{ port: number; service: string; banner: string }> = Array.isArray(
@@ -611,7 +662,7 @@ export async function executeUserTerminalCommand(
           `[+] PROVISIONED ISOLATED LAB ENVIRONMENT: ${sessionId}`,
           `    Mission         : [${m.code}] ${m.title}`,
           `    Assigned Target : ${m.lab_target_ip} (${m.lab_target_hostname})`,
-          `    Isolation Mode  : Linux Network Namespace (non-root uid=65534, no-new-privs, egress blocked)`,
+          `    Isolation Mode  : Disposable Docker internal-only lab network (non-root uid=65534, no-new-privs, no public/host routes)`,
           `    Recommended Cmd : nmap --profile ${m.required_profile || 'service'} --target ${m.lab_target_ip}`
         ],
         data: {
@@ -670,7 +721,7 @@ export async function executeUserTerminalCommand(
           `INSERT INTO tool_audit_logs (
             id, user_id, lab_session_id, mission_id, tool_name, profile,
             target_ip, sanitized_args, allowed, rejection_reason, isolation_mode
-          ) VALUES ($1, $2, $3, $4, 'nmap', $5, $6, '[]'::jsonb, FALSE, $7, 'linux-netns-nonroot')`,
+          ) VALUES ($1, $2, $3, $4, 'nmap', $5, $6, '[]'::jsonb, FALSE, $7, 'not-executed')`,
           [
             generateId('taud'),
             userId,
@@ -693,14 +744,46 @@ export async function executeUserTerminalCommand(
         };
       }
 
-      // 3. Dispatch real Nmap scan to the isolated Lab Worker (separate short-lived netns + non-root process)
-      const scanResult = await executeIsolatedLabScan({
+      // 3. Dispatch the real scan to the durable lab worker queue (the API process has
+      //    no Docker endpoint and never executes nmap itself).
+      const dispatch = await dispatchLabScanToWorker(db, {
         tool: 'nmap',
         profile: cmd.profile,
+        missionId: labSession.mission_id,
+        missionCode: labSession.mission_code,
         targetIp: requestedTargetIp,
         assignedTargetIp: labSession.target_ip,
         services: Array.isArray(labSession.lab_services_spec) ? labSession.lab_services_spec : []
       });
+
+      if (dispatch.status !== 'completed') {
+        await db.query(
+          `INSERT INTO tool_audit_logs (
+            id, user_id, lab_session_id, mission_id, tool_name, profile,
+            target_ip, sanitized_args, allowed, rejection_reason, isolation_mode
+          ) VALUES ($1, $2, $3, $4, 'nmap', $5, $6, '[]'::jsonb, FALSE, $7, 'worker-not-completed')`,
+          [
+            generateId('taud'),
+            userId,
+            labSession.id,
+            labSession.mission_id,
+            cmd.profile,
+            requestedTargetIp,
+            `Lab worker did not complete the scan (${dispatch.status}): ${dispatch.reason}`
+          ]
+        );
+        return {
+          ok: false,
+          command: rawCommand,
+          category: 'lab_tool',
+          lines: [
+            `[LAB_WORKER_${dispatch.status.toUpperCase()}] ${dispatch.reason}`,
+            'No scan was executed and no mission progress was credited.'
+          ]
+        };
+      }
+
+      const scanResult = dispatch.result;
 
       // 4. Record immutable audit entry in tool_audit_logs
       await db.query(
@@ -731,7 +814,10 @@ export async function executeUserTerminalCommand(
           ok: false,
           command: rawCommand,
           category: 'lab_tool',
-          lines: [`[LAB_POLICY_DENIED] ${scanResult.rejectionReason}`]
+          lines: [
+            `[LAB_POLICY_DENIED] ${scanResult.rejectionReason}`,
+            'No scan was executed and no mission progress was credited.'
+          ]
         };
       }
 
@@ -795,7 +881,6 @@ export async function executeUserTerminalCommand(
             triggerReason: `completed lab audit ${labSession.mission_code} on ${labSession.target_ip}`,
             preferredReaction: 'patching'
           });
-          await processPendingOutboxJobs(db, 'inline-worker', 2);
         }
 
         missionCompleted = {
@@ -843,7 +928,8 @@ export async function executeUserTerminalCommand(
         const res = await executePvpOperation(db, {
           attackerUserId: userId,
           targetNodeIdentifier: cmd.target,
-          method: cmd.method
+          method: cmd.method,
+          requestId: generateId('pvp')
         });
 
         return {

@@ -2,56 +2,63 @@
 
 **RootWars** is a playable browser-based open-world hacking MMO with a dark cyber-security desktop interface, a typed command-line terminal, an interconnected regional world grid (24 nodes in the **Neo-Cascadia Autonomous Grid** + 3 nodes in the **Helvetia Quantum Clearing Zone**), dynamic NPC factions, an atomic double-entry fictional currency ledger (`RWC`), hacking groups, alliances, bounded Open PvP, and isolated real-tool **Nmap** lab missions.
 
-> **Branding & Safety Notice**: RootWars uses original RootWars branding and artwork inspired by the general look and feel of dark security desktops. RootWars is an independent fictional game, is **not** affiliated with or endorsed by Kali Linux, does **not** boot an operating system, and **never** exposes a player's computer, home network, or public IP to the game.
+> **Branding & Safety Notice**: RootWars uses original RootWars branding and artwork inspired by the general look and feel of dark security desktops. RootWars is an independent fictional game, is **not** affiliated with or endorsed by Kali Linux, does **not** boot an operating system, and **never** exposes a player's computer, home network, or public IP to the game. Real `nmap` is executed only inside short-lived disposable containers against RootWars-owned lab targets.
 
 ---
 
 ## 1. Architecture Overview
 
-- **Client (`src/client/`)**: TypeScript + React 19 + Vite desktop environment featuring a top telemetry panel, application launcher, bottom dock, and 7 movable/resizable desktop windows (`rw-term` Terminal open by default, `net-atlas` World Map, `ops-center` Missions & Isolated Labs, `syndicate-hq` Groups/Alliances/Open PvP/Chat, `nexus-market` Equipment & Ledger, `intel-watch` Factions/World Events/Audit Logs, and `sys-config` Settings & Command Manual).
-- **API & WebSocket Gateway (`src/server/`)**: Stateless Fastify server (`src/server/app.ts`) providing REST endpoints and `/ws` WebSockets for chat (`#global`, `#group`, `#alliance`), mission alerts, PvP incident alerts, and world updates.
-- **Database Layer (`src/db/`, `migrations/001_initial_schema.sql`)**: PostgreSQL 16 as the durable source of truth. Connects via `pg.Pool` when `DATABASE_URL` points to an external PostgreSQL daemon (such as in `docker-compose.yml`), and automatically uses persistent on-disk PostgreSQL 16 (`@electric-sql/pglite` stored in `./.data/pgdata`) when running standalone without a local Docker daemon.
-- **Ephemeral State & Rate Limiting (`src/db/redis.ts`)**: Connects to Redis (`REDIS_URL`) via `ioredis` for rate limits (`rl:*`), online presence (`presence:online`), and realtime pub/sub (`rootwars:events`), with automatic fallback to embedded `ioredis-mock` in standalone local environments.
-- **Durable Job Outbox & Workers (`src/workers/outbox-worker.ts`, `src/workers/index.ts`)**: PostgreSQL-backed `outbox_jobs` table processing asynchronous NPC faction reactions, dynamic world events, mission timers, node outage recovery, and isolated lab scans.
-- **Isolated Real-Tool Lab Runner (`src/workers/lab-runner.ts`, `src/workers/lab-sandbox-child.ts`)**: Executes real `/usr/local/bin/nmap` strictly inside short-lived, disposable Linux network namespaces (`ip netns`) as unprivileged `uid=65534(nobody)` / `gid=65534(nogroup)` with `--no-new-privs` and `prlimit` memory/CPU/process caps against ephemeral `10.240.x.x` mission target listeners.
+- **Client (`src/client/`)**: TypeScript + React 19 + Vite desktop environment with 7 movable/resizable windows (`rw-term`, `net-atlas`, `ops-center`, `syndicate-hq`, `nexus-market`, `intel-watch`, `sys-config`). Sessions are carried by an **HttpOnly `rw_session` cookie**; the client never stores a token in `localStorage` or puts one in a WebSocket URL.
+- **API & WebSocket Gateway (`src/server/app.ts`, `src/server/realtime.ts`)**: Fastify server exposing REST endpoints and `/ws`. CORS uses an explicit origin allowlist, `trustProxy` is opt-in, and the WebSocket handshake is authenticated from the session cookie and validated against the allowlisted origin.
+- **Realtime delivery (`src/server/realtime.ts`)**: every gateway instance subscribes to the Redis `rootwars:events` channel and fans published events out to **local** sockets only (no republish loops). Group/alliance/user channel membership is re-checked from the database per delivery, so membership changes apply to already-connected WebSockets.
+- **Database Layer (`src/db/`, `migrations/`)**: PostgreSQL 16 via `pg.Pool` when `DATABASE_URL` is set, or embedded PGlite (`./.data/pgdata`) for standalone local development. PvP, bounty and ledger writes are single atomic transactions with idempotency keys (see `migrations/002_pvp_atomicity.sql`).
+- **Rate limiting & sessions (`src/db/redis.ts`, `src/server/app.ts`)**: Redis-backed counters (`rl:*`), `presence:online`, and pub/sub. If the Redis backend is unreachable the API **fails closed** (`RATE_LIMIT_FAIL_MODE=closed`, the default) instead of silently disabling limits.
+- **Durable Job Outbox & Workers (`src/workers/outbox-worker.ts`, `src/workers/index.ts`)**: PostgreSQL-backed `outbox_jobs` table processing NPC faction reactions, world events, mission timers, node recovery, **and lab scans**. Only processes with a worker role start the loop, so scaling API instances never duplicates world/outbox workers.
+- **Isolated Real-Tool Lab Runner (`src/workers/lab-docker-backend.ts`, `src/workers/lab-runner.ts`)**: the API process enqueues a `lab_scan` job; the worker executes real `nmap` (`/usr/bin/nmap`, fixed path, `execFile` without a shell) inside a hardened container attached to a **per-mission internal-only Docker network**, against a disposable RootWars-owned target container bound to the mission's assigned `10.240.x.x` address. If no dedicated lab Docker endpoint is configured the scan **fails closed** with `LAB_BACKEND_UNAVAILABLE` and no mission credit — it never scans a loopback emulator and pretends that was the mission target.
 
 ---
 
 ## 2. Quick Start & Exact Run Commands
 
-### Option A: Standalone Local Run (Zero External Daemons Required)
+### Option A: Standalone Local Run (no external daemons, no Docker)
 
 ```bash
 # 1. Install dependencies
 npm install
 
-# 2. Ensure static Nmap binary & service probes are installed (if not already on PATH)
-bash scripts/install-nmap.sh
-
-# 3. Run PostgreSQL migrations & seed world data (27 nodes, 9 factions, 8 missions, market, groups)
+# 2. Create the schema and the world data (no accounts, no demo credentials)
 npm run db:migrate
 npm run db:seed
 
-# 4. Build client & start the RootWars server on http://0.0.0.0:3000
+# 3. OPTIONAL: create local demo accounts with a one-time generated password.
+#    The password is printed once and is never stored in the repo or in a default.
+npm run db:demo-seed
+
+# 4. Build the client and start the server on http://0.0.0.0:3000
 npm run build
 npm run dev
 ```
 
-Open `http://localhost:3000` in your browser.
-- **Demo Operator Login**: Handle `cipher_wolf` / Passphrase `RootWars!2026` (or register any new operator handle to receive a personal home network node and `2,500 RWC` starting stipend).
+Open `http://localhost:3000` and register a new operator handle (new operators receive a personal home node and a `2,500 RWC` starting stipend). There is **no shared demo password** in a deployed instance: demo accounts exist only if a local administrator runs `npm run db:demo-seed` and keeps the generated password.
 
-### Option B: Docker Compose (Multi-Container Setup)
+Lab missions in this mode will fail closed (`LAB_BACKEND_UNAVAILABLE`) because there is no dedicated lab Docker endpoint; that is intentional and reported in the terminal output.
+
+### Option B: Docker Compose (multi-container)
 
 ```bash
+export SESSION_SECRET="$(openssl rand -hex 32)"
+export POSTGRES_PASSWORD="$(openssl rand -hex 16)"
+export ALLOWED_ORIGINS="https://your-host.example"
+
+# Build the lab images once (scanner = alpine + /usr/bin/nmap, target = service emulator)
+bash scripts/build-lab-images.sh
+
 docker compose up --build
 ```
 
-This launches:
-- `postgres` (`postgres:16-alpine`)
-- `redis` (`redis:7-alpine`)
-- `api` (Fastify API + WebSocket + Static Client on port `3000`)
-- `lab-worker` (Non-root `65534:65534`, `cap_drop: ALL`, `no-new-privileges:true`, resource-limited worker attached to `internal: true` bridge network `10.240.0.0/16`)
-- `lab-target-sovereign` (Isolated `10.240.10.10` lab target container)
+This launches `postgres`, `redis`, `api` (`ROLE=api`, compiled production server, **no Docker socket, non-root**), `lab-worker` (`ROLE=worker`, non-root `65534:65534`, `cap_drop: ALL`, `no-new-privileges`, resource-limited) and `lab-dind` (a dedicated Docker daemon used exclusively for disposable lab containers, reachable only from the worker over the internal `lab_control_net`). The API and worker refuse to start in production without `SESSION_SECRET`, `POSTGRES_PASSWORD`, `ALLOWED_ORIGINS` and `REDIS_URL`, and refuse known development secrets.
+
+Leftover lab resources can always be removed with `LAB_DOCKER_HOST=tcp://localhost:2375 bash scripts/reap-lab-resources.sh`.
 
 ---
 
@@ -69,10 +76,10 @@ RootWars uses a strict typed command parser (`src/shared/commandParser.ts`) that
 - `jobs` — List available world contracts and isolated Lab Missions.
 - `accept --job <job-id|code>` — Accept a mission (e.g. `accept --job msn-lab-01`).
 - `lab list` — List all isolated `10.240.x.x` real-tool lab missions.
-- `lab open --mission <mission-id>` — Provision an isolated lab target for the specified mission.
+- `lab open --mission <mission-id>` — Provision the isolated lab target for the specified mission.
 - `lab close` — Close and tear down the active lab session.
 - `disconnect` — Disconnect from the current in-world network node.
-- `pvp attack --target <player-node> --method <probe|heist|disrupt|contest>` — Launch a bounded Open PvP operation against an in-game player network node.
+- `pvp attack --target <player-node> --method <probe|heist|disrupt|contest>` — Launch a bounded Open PvP operation (atomic + idempotent; cooldowns, per-attack and 24h loss caps enforced).
 - `defend --action <monitor|patch|segment|decoy|ir|recover>` — Upgrade defenses or recover your personal home node.
 - `transfer --to <username> --amount <rwc> [--memo <text>]` — Atomically transfer RWC to another operator.
 - `factions` — View NPC faction alert levels, policy stances, tariffs, and security advisories.
@@ -81,37 +88,52 @@ RootWars uses a strict typed command parser (`src/shared/commandParser.ts`) that
 
 ### Isolated Lab-Tool Command
 - `nmap --profile <quick|service|full-ports|compliance-audit> [--target <10.240.x.x>]`
-  - Executes real `/usr/local/bin/nmap` using `execFile` (never a shell) inside a disposable Linux network namespace against your active mission's assigned `10.240.x.x` target.
-  - Arbitrary Nmap scripts (`--script`, `-sC`), file writes (`-oN`, `-oX`, `-iL`), spoofing options, and non-lab IPs (`1.1.1.1`, `127.0.0.1`, `192.168.x.x`) are rejected by the parser and server validator.
+  - Queues a real `nmap` run (`/usr/bin/nmap`, fixed path, `execFile` never a shell) inside a hardened scanner container on the active mission's internal-only lab network.
+  - Only the mission-assigned address is accepted. Arbitrary Nmap scripts (`--script`, `-sC`), file writes (`-oN`, `-oX`, `-iL`), spoofing options, and non-lab addresses (`1.1.1.1`, `127.0.0.1`, `192.168.x.x`) are rejected by the parser and re-validated by the server before any container starts.
 
 ---
 
-## 4. Lab Safety & Network Isolation Verification
+## 4. Lab Safety & Isolation (what is enforced, and what is not verified here)
 
-1. **No Shell Evaluation**: `parseTerminalCommand` rejects shell metacharacters, and `lab-sandbox-child.ts` invokes `/usr/bin/prlimit` -> `setpriv` -> `/usr/local/bin/nmap` via `child_process.execFile` with a fixed array of allowlisted arguments from `APPROVED_NMAP_PROFILES`.
-2. **Disposable Network Namespace (`ip netns`)**: Each scan creates a fresh `rw-lab-<random>` Linux network namespace with **no external interface and no default route**. Only the single assigned `10.240.x.x/32` mission IP is bound inside the namespace, and the namespace is deleted immediately in a `finally` block (`ip netns del`).
-3. **Non-Root & Resource Limited**: Inside the namespace, `setpriv --reuid=65534 --regid=65534 --clear-groups --no-new-privs` drops privileges to `nobody:nogroup`, and `prlimit --as=268435456 --cpu=8 --nproc=32` enforces strict memory, CPU, and process limits.
-4. **Automated Isolation Proof (`verifyLabNetworkIsolation`)**:
-   - Verified `effectiveUid = 65534` and `effectiveGid = 65534`.
-   - Verified outbound TCP connection to public internet (`1.1.1.1:80`) fails immediately with kernel `ENETUNREACH`.
-   - Verified outbound TCP connection to host loopback (`127.0.0.1:22`) is isolated and refused.
-   - Verified real Nmap scan against assigned lab target (`10.240.99.10`) succeeds and enumerates open ports.
+Enforced by construction (`src/workers/lab-docker-backend.ts`):
+
+1. **Per-mission disposable network**: `docker network create --driver bridge --internal --subnet 10.240.<mission>.0/24` labelled `rootwars.disposable=true`. `--internal` removes the gateway, so there is no route to the public internet or the host.
+2. **RootWars-owned target only**: a disposable target container is created per scan with `--ip <mission-assigned address>`, `--user 65534:65534`, `--read-only`, `--cap-drop ALL`, `--security-opt no-new-privileges`, `--pids-limit`, `--memory`, `--memory-swap`, `--cpus` and a `noexec,nosuid` tmpfs. The player can never provide the target address.
+3. **Hardened scanner**: `--user 65534:65534`, `--read-only`, `--cap-drop ALL`, `--security-opt no-new-privileges`, pids/memory/CPU limits, `nofile`/`fsize` ulimits, `maxBuffer` + timeout on the `execFile` call, and a fixed allowlisted argument vector from `APPROVED_NMAP_PROFILES`.
+4. **API process never runs lab tools**: the API enqueues a durable `lab_scan` outbox job and polls for the result. The API container has no Docker socket; the scan runs in the worker against a dedicated lab Docker daemon (in Compose: `lab-dind`, internal-only).
+5. **Fail closed**: without a dedicated endpoint (`LAB_DOCKER_HOST`) the backend reports `LAB_BACKEND_UNAVAILABLE`, records `isolation_mode='unavailable'` in `tool_audit_logs`, discovers zero ports, and awards no mission progress (verified by `tests/lab-mission-flow.test.ts`).
+6. **Teardown on every path**: the mission network, target container and scanner container are removed in a `finally` block, and `scripts/reap-lab-resources.sh` reaps anything left behind by a hard kill.
+
+**Verification status (do not overstate):** `tests/lab-docker.integration.test.ts` is the only suite that exercises a real Docker daemon and real networks; it asserts the approved target is reachable, another mission's target is unroutable, `1.1.1.1`/`127.0.0.1` are unreachable, `ip route` has no `default`, the scanner runs as `uid=65534`, and no labelled containers/networks are left behind. In environments without Docker (including the sandbox used for the last review run) that suite is **skipped with a loud banner** and this document makes **no isolation claim from that run**. Run it in a disposable Docker host with:
+
+```bash
+bash scripts/build-lab-images.sh
+ROOTWARS_REQUIRE_DOCKER_TESTS=true ROOTWARS_BUILD_LAB_IMAGES=true npx vitest run tests/lab-docker.integration.test.ts
+```
+
+`ROOTWARS_REQUIRE_DOCKER_TESTS=true` turns the skip into a hard failure, so CI can require real isolation rather than silently passing.
 
 ---
 
 ## 5. Environment Variables
 
-See `.env.example` for all configurable parameters:
+See `.env.example` for the full list. Security-relevant values:
 
 | Variable | Default | Description |
 |---|---|---|
-| `PORT` | `3000` | HTTP & WebSocket listen port |
-| `HOST` | `0.0.0.0` | Listen address |
-| `DATABASE_URL` | `postgresql://...` | External PostgreSQL URL (falls back to persistent PGlite in `./.data/pgdata` if unreachable) |
-| `PGLITE_DATA_DIR` | `./.data/pgdata` | On-disk directory for embedded PostgreSQL 16 engine |
-| `REDIS_URL` | `redis://localhost:6379` | Redis URL (falls back to embedded `ioredis-mock` if unreachable) |
-| `SESSION_SECRET` | `...` | Cookie signing secret |
-| `SESSION_TTL_SECONDS` | `86400` | Session expiration (24 hours) |
+| `NODE_ENV` | `development` | `production` enables cookie `Secure`, disables dev fallbacks and enforces the startup guards |
+| `SESSION_SECRET` | dev-only fallback | **Required in production**, ≥32 chars, must not be a known development secret |
+| `ALLOWED_ORIGINS` | localhost dev origins | **Required in production**; comma-separated CORS/WebSocket origin allowlist |
+| `TRUST_PROXY` | unset | Explicit trusted proxy list (`false`/IP(s)); `true` is rejected in production |
+| `RATE_LIMIT_FAIL_MODE` | `closed` | On Redis failure auth/command/chat fail closed (503); `open` is rejected in production |
+| `COOKIE_SECURE` | follows `NODE_ENV` | Force `Secure` cookies outside production (e.g. behind TLS-terminating proxies) |
+| `DATABASE_URL` | *(PGlite)* | PostgreSQL URL; production requires a non-default password |
+| `REDIS_URL` | *(ioredis-mock)* | **Required in production** for rate limits, presence and cross-instance realtime |
+| `ROLE` | `all` | `api` or `worker`; only worker roles start the outbox/world loop |
+| `LAB_DOCKER_HOST` | unset | Dedicated lab Docker endpoint (e.g. `tcp://lab-dind:2375`); unset ⇒ lab scans fail closed |
+| `LAB_ALLOW_HOST_DOCKER` | `false` | Development-only escape hatch to use the local Docker socket; rejected in production |
+| `LAB_NMAP_PATH` / `LAB_NMAP_DATADIR` | `/usr/bin/nmap` / `/usr/share/nmap` | Fixed binary path inside the scanner image |
+| `LAB_SCANNER_IMAGE` / `LAB_TARGET_IMAGE` | `rootwars/lab-scanner:1.0.0` / `rootwars/lab-target:1.0.0` | Lab images |
 | `PVP_MAX_LOSS_BPS` | `1000` | Max RWC loss per PvP heist (1000 bps = 10%) |
 | `PVP_DAILY_LOSS_CAP_BPS` | `2000` | Max cumulative 24h RWC loss (2000 bps = 20%) |
 | `PVP_MIN_PROTECTED_BALANCE` | `500` | Minimum protected RWC balance floor |
@@ -124,17 +146,45 @@ See `.env.example` for all configurable parameters:
 ## 6. Testing & Load Testing
 
 ```bash
-# Run the automated Vitest verification suite (14 tests across all 6 required areas)
+# Full typecheck (client, server, scripts, tests)
+npx tsc --noEmit -p tsconfig.json
+
+# Automated Vitest suite (unit + integration; Docker lab isolation tests skip loudly
+# without a Docker daemon, and fail hard with ROOTWARS_REQUIRE_DOCKER_TESTS=true)
 npm test
 
-# Run the realistic concurrent MMO load test
+# Repeatable load test (embedded backends by default; see section below for a real stack)
 npm run loadtest
 ```
 
-### Actual Load-Test Summary (`LOAD_TEST_RESULTS.json`)
-- **Tested Environment**: Linux 6.1.158+ x86_64, 2x Intel Xeon vCPU @ 2.60GHz, 3.85 GB RAM, Node.js v22.22.3, PGlite (embedded PostgreSQL 16), Redis-Mock.
-- **Concurrent Sessions**: `120` authenticated sessions (`120` open WebSockets; `48` idle presence sessions + `72` active workers executing continuous mixed requests across terminal commands, map reads, mission reads, and chat broadcasts).
-- **Total Requests**: `864` HTTP requests + `7,135` SQL queries in `10.54s` (`0` errors, `100%` success).
-- **Throughput**: `81.96 req/sec` (`676.87 SQL queries/sec` at `1.24 ms` average query time).
-- **Latency Percentiles**: `p50 = 281.25 ms`, `p90 = 381.02 ms`, `p95 = 3012.09 ms`, `p99 = 7898.04 ms`.
-- **Bottlenecks & Scaling Path**: Under standalone embedded PGlite, all 72 active workers share a single in-process WASM PostgreSQL connection, saturating DB execution time (`8.85s` of `10.54s`). Deploying with external PostgreSQL (`pg.Pool` with connection pooling + read replicas) and external Redis via `docker-compose.yml` removes single-connection serialization and enables horizontal scaling across multiple stateless Fastify API instances.
+Test inventory (see `COMPLETION_REPORT.md` for exact run results):
+
+| Suite | Kind | Covers |
+|---|---|---|
+| `tests/command-parser.test.ts` | unit | typed parser, shell-metacharacter rejection, lab-target allowlisting |
+| `tests/lab-policy.test.ts` | unit | lab target/profile/service validation, fail-closed backend, nmap output parsing |
+| `tests/lab-mission-flow.test.ts` | integration | accept → `lab open` → assigned-target fail-closed scan → audit trail, no credit |
+| `tests/pvp-atomicity.test.ts` | integration | concurrent attacks, daily cap, bounty race, idempotent replay, mid-operation rollback, protected floor |
+| `tests/ledger.test.ts` | integration | idempotent transfers, overdraft protection under 15 concurrent transfers |
+| `tests/realtime.test.ts` | integration | two simulated gateways, cross-instance delivery, membership changes, no duplicates |
+| `tests/auth-security.test.ts` | integration | HttpOnly cookies, WS origin/cookie auth, CORS, admin-only world events, fail-closed limits, trusted proxy |
+| `tests/seed-safety.test.ts` | unit | no demo accounts from a plain seed, production secret guards, deploy config regressions |
+| `tests/lab-docker.integration.test.ts` | integration (Docker) | real container/network isolation, skipped without Docker |
+
+### Load test (`scripts/load-test.ts`)
+
+The load test is repeatable and self-describing: it reports the environment and backend it actually ran against, a gradual concurrency ramp, p50/p90/p95/p99 latency, error counts by category and status, DB pool saturation, outbox queue depth/lag, and WebSocket delivery counts. It also records what the run does **not** prove.
+
+```bash
+# Embedded backends (fast smoke benchmark; single serialized PGlite connection)
+npm run loadtest
+
+# Representative measurement: real PostgreSQL + Redis and 3 API instances
+LOADTEST_DATABASE_URL=postgresql://rootwars:<pw>@localhost:5432/rootwars \
+LOADTEST_REDIS_URL=redis://localhost:6379 \
+LOADTEST_INSTANCES=3 \
+LOADTEST_MAX_SESSIONS=120 \
+npm run loadtest
+```
+
+Results are written to `LOAD_TEST_RESULTS.json`. The current report is the embedded-backend run performed in this review sandbox; it is **not** evidence of thousands of concurrent players, and it says so in `claimsNotSupportedByThisRun`.

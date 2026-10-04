@@ -42,8 +42,21 @@ export async function createRedisClients(redisUrl?: string): Promise<RedisClient
           await Promise.allSettled([client.quit(), pub.quit(), sub.quit()]);
         }
       };
-    } catch {
-      // Fallback to embedded ioredis-mock
+    } catch (err: any) {
+      // Production must never silently degrade to an in-process mock: rate limiting
+      // would stop being shared and cross-instance realtime fan-out would break while
+      // the deployment still looked healthy. Fail fast instead.
+      if (process.env.NODE_ENV === 'production') {
+        throw new Error(
+          `FATAL: REDIS_URL is configured but Redis is unreachable (${String(err?.message ?? err).trim()}). ` +
+            'Production never falls back to the embedded mock backend.'
+        );
+      }
+      // Development/test fallback to embedded ioredis-mock.
+      console.warn(
+        `[RootWars Redis] Redis at REDIS_URL is unreachable (${String(err?.message ?? err).trim()}). ` +
+          'Falling back to the embedded mock backend for local development.'
+      );
     }
   }
 

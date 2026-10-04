@@ -13,6 +13,7 @@
     "start": "node dist/server/server/index.js",
     "db:migrate": "tsx src/db/migrate.ts",
     "db:seed": "tsx src/db/seed.ts",
+    "db:demo-seed": "tsx src/db/demo-seed.ts",
     "test": "vitest run",
     "test:watch": "vitest",
     "loadtest": "tsx scripts/load-test.ts"

@@ -1,68 +1,156 @@
 {
-  "timestamp": "2026-10-03T11:42:01.103Z",
+  "timestamp": "2026-10-03T15:55:01.383Z",
+  "gitCommit": "4680558",
+  "command": "npm run loadtest",
   "environment": {
     "platform": "Linux 6.1.158+ (x64)",
     "nodeVersion": "v22.22.3",
     "cpuModel": "Intel(R) Xeon(R) Processor @ 2.60GHz",
     "cpuCores": 2,
     "totalMemoryGb": 3.85,
-    "dbBackend": "pglite",
-    "redisBackend": "redis-mock"
+    "databaseBackend": "pglite",
+    "redisBackend": "redis-mock",
+    "apiInstances": 1,
+    "rateLimitsRaisedForBenchmark": true
   },
   "workload": {
-    "concurrentSessions": 120,
-    "connectedWebSockets": 120,
-    "idleSessions": 48,
-    "activeSessions": 72,
-    "totalRequests": 864,
-    "successfulRequests": 864,
-    "failedRequests": 0,
-    "durationSeconds": 10.54,
-    "requestsPerSecond": 81.96
+    "rampSteps": 4,
+    "targetSessions": 120,
+    "provisionedSessions": 120,
+    "provisioningFailures": 0,
+    "idleWebSocketSessions": 48,
+    "activeWorkerSessions": 72,
+    "roundsPerWorker": 10,
+    "totalRequests": 900,
+    "durationSeconds": 25.92,
+    "requestsPerSecond": 34.72
   },
-  "latencyMs": {
-    "mean": 591.17,
-    "p50": 281.25,
-    "p90": 381.02,
-    "p95": 3012.09,
-    "p99": 7898.04,
-    "max": 9065.36
-  },
-  "breakdownByCategory": {
-    "terminal_cmd": {
-      "count": 348,
-      "p50Ms": 286.33,
-      "p95Ms": 5584.43,
-      "p99Ms": 8520.05
+  "http": {
+    "count": 900,
+    "successful": 900,
+    "failed": 0,
+    "errorRatePercent": 0,
+    "responsesByStatus": {
+      "200": 900
     },
-    "map_read": {
-      "count": 258,
-      "p50Ms": 290.73,
-      "p95Ms": 904.54,
-      "p99Ms": 7610.19
+    "latencyMs": {
+      "mean": 380.06,
+      "p50": 349.08,
+      "p90": 501.27,
+      "p95": 587.67,
+      "p99": 2532.68,
+      "max": 3206.94
     },
-    "mission_update": {
-      "count": 172,
-      "p50Ms": 271.11,
-      "p95Ms": 821.37,
-      "p99Ms": 6509.44
-    },
-    "chat": {
-      "count": 86,
-      "p50Ms": 267.72,
-      "p95Ms": 4959.34,
-      "p99Ms": 6892.61
+    "firstErrors": [],
+    "byCategory": {
+      "terminal_cmd": {
+        "count": 360,
+        "successful": 360,
+        "failed": 0,
+        "errorRatePercent": 0,
+        "responsesByStatus": {
+          "200": 360
+        },
+        "latencyMs": {
+          "mean": 426.15,
+          "p50": 362.78,
+          "p90": 566.64,
+          "p95": 1208.59,
+          "p99": 2631,
+          "max": 3206.94
+        },
+        "firstErrors": []
+      },
+      "map_read": {
+        "count": 270,
+        "successful": 270,
+        "failed": 0,
+        "errorRatePercent": 0,
+        "responsesByStatus": {
+          "200": 270
+        },
+        "latencyMs": {
+          "mean": 367.19,
+          "p50": 349.34,
+          "p90": 465.01,
+          "p95": 568.59,
+          "p99": 2532.68,
+          "max": 3097.4
+        },
+        "firstErrors": []
+      },
+      "mission_read": {
+        "count": 180,
+        "successful": 180,
+        "failed": 0,
+        "errorRatePercent": 0,
+        "responsesByStatus": {
+          "200": 180
+        },
+        "latencyMs": {
+          "mean": 316.73,
+          "p50": 284.28,
+          "p90": 460.53,
+          "p95": 564.25,
+          "p99": 2518.94,
+          "max": 2611.87
+        },
+        "firstErrors": []
+      },
+      "chat_send": {
+        "count": 90,
+        "successful": 90,
+        "failed": 0,
+        "errorRatePercent": 0,
+        "responsesByStatus": {
+          "200": 90
+        },
+        "latencyMs": {
+          "mean": 361,
+          "p50": 273.31,
+          "p90": 511.71,
+          "p95": 603.43,
+          "p99": 2624.48,
+          "max": 2624.48
+        },
+        "firstErrors": []
+      }
     }
   },
-  "databaseLoad": {
-    "totalQueriesExecuted": 7135,
-    "queriesPerSecond": 676.87,
-    "avgQueryLatencyMs": 1.24,
-    "totalDbTimeMs": 8850.3
+  "websocketDelivery": {
+    "connectedSockets": 120,
+    "chatMessagesSent": 90,
+    "expectedDeliveries": 8100,
+    "actualDeliveries": 8100,
+    "deliveryRatio": 1,
+    "socketErrors": 0
   },
-  "bottlenecksObserved": [
-    "Embedded PGlite (single-connection WASM PostgreSQL 16) serializes write transactions in-process; switching to external PostgreSQL 16 with pg.Pool (25 connections) via Docker Compose removes single-connection queuing.",
-    "Password hashing (scrypt) during simultaneous registration/login bursts is CPU-intensive (~35ms per hash); steady-state token validation uses SHA-256 + indexed session lookup (<1ms).",
-    "Isolated real-tool Nmap lab scans spawn a Linux network namespace + non-root Nmap process (~180-350ms per scan) and must remain offloaded to dedicated lab-worker pools rather than API processes."
+  "database": {
+    "poolStats": {
+      "backend": "pglite",
+      "total": 1,
+      "idle": 0,
+      "waiting": 0,
+      "max": 1,
+      "serialized": true
+    },
+    "maxWaitingRequestsObserved": 0,
+    "notes": "PGlite: every query funnels through one connection; latency under load is serialization-bound, not PostgreSQL-bound."
+  },
+  "outboxQueue": {
+    "maxDepthObserved": 4,
+    "maxLagSecondsObserved": 0.17,
+    "finalCountsByStatus": {
+      "completed": 114
+    }
+  },
+  "claimsSupportedByThisRun": [
+    "120 concurrent authenticated WebSocket sessions with 900 HTTP requests (p50 349.08ms / p95 587.67ms / p99 2532.68ms, 0 errors) against 1 API instance(s) using pglite + redis-mock.",
+    "WebSocket fan-out delivery ratio 1 for global chat across 1 instance(s)."
+  ],
+  "claimsNotSupportedByThisRun": [
+    "This run does NOT demonstrate thousands of concurrent players.",
+    "Database backend is embedded PGlite (single in-process, single-connection PostgreSQL). Throughput and tail latency here are NOT representative of a PostgreSQL-backed deployment.",
+    "Redis backend is the in-process ioredis-mock; multi-instance pub/sub is simulated in-process."
   ]
 }

@@ -1,22 +1,26 @@
-version: '3.9'
+# RootWars orchestration compose.
+#
+# Production-shaped: secrets and origins are REQUIRED environment variables, the
+# API runs the compiled server with ROLE=api (no embedded worker, no Docker socket),
+# and the lab worker talks only to a dedicated lab Docker daemon on an internal
+# network. See .env.example for the local development template.
+
+name: rootwars
 
 services:
   postgres:
     image: postgres:16-alpine
     restart: unless-stopped
     environment:
-      POSTGRES_USER: rootwars
-      POSTGRES_PASSWORD: rootwars_dev_password
-      POSTGRES_DB: rootwars
-    ports:
-      - '5432:5432'
+      POSTGRES_USER: ${POSTGRES_USER:-rootwars}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD must be set (no default database password)}
+      POSTGRES_DB: ${POSTGRES_DB:-rootwars}
     volumes:
       - pgdata:/var/lib/postgresql/data
-      - ./migrations/001_initial_schema.sql:/docker-entrypoint-initdb.d/001_initial_schema.sql:ro
     networks:
       - app_net
     healthcheck:
-      test: ['CMD-SHELL', 'pg_isready -U rootwars -d rootwars']
+      test: ['CMD-SHELL', 'pg_isready -U ${POSTGRES_USER:-rootwars} -d ${POSTGRES_DB:-rootwars}']
       interval: 5s
       timeout: 5s
       retries: 10
@@ -24,8 +28,6 @@ services:
   redis:
     image: redis:7-alpine
     restart: unless-stopped
-    ports:
-      - '6379:6379'
     networks:
       - app_net
     healthcheck:
@@ -40,14 +42,20 @@ services:
       dockerfile: Dockerfile.api
     restart: unless-stopped
     ports:
-      - '3000:3000'
+      - '${API_PORT:-3000}:3000'
     environment:
       NODE_ENV: production
+      ROLE: api
       PORT: 3000
       HOST: 0.0.0.0
-      DATABASE_URL: postgresql://rootwars:rootwars_dev_password@postgres:5432/rootwars
+      DATABASE_URL: postgresql://${POSTGRES_USER:-rootwars}:${POSTGRES_PASSWORD:?POSTGRES_PASSWORD must be set}@postgres:5432/${POSTGRES_DB:-rootwars}
       REDIS_URL: redis://redis:6379
-      SESSION_SECRET: docker-compose-dev-secret-change-in-prod
+      SESSION_SECRET: ${SESSION_SECRET:?SESSION_SECRET must be set to a unique 32+ character value}
+      ALLOWED_ORIGINS: ${ALLOWED_ORIGINS:?ALLOWED_ORIGINS must list the exact browser origins}
+      # Explicit trusted proxies only (comma separated IPs/CIDRs). Leave unset when
+      # the API is directly exposed; never set TRUST_PROXY=true in production.
+      TRUST_PROXY: ${TRUST_PROXY:-}
+      RATE_LIMIT_FAIL_MODE: closed
     depends_on:
       postgres:
         condition: service_healthy
@@ -55,65 +63,82 @@ services:
         condition: service_healthy
     networks:
       - app_net
+    # The API runs as the non-root `node` user (Dockerfile.api) with no added
+    # capabilities. Deliberately NO docker socket mount on the API.
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
 
   lab-worker:
     build:
       context: .
       dockerfile: Dockerfile.worker
-    user: '65534:65534'
-    read_only: true
-    tmpfs:
-      - /tmp:size=32M,noexec,nosuid,nodev
-    cap_drop:
-      - ALL
-    security_opt:
-      - no-new-privileges:true
-    deploy:
-      resources:
-        limits:
-          cpus: '0.50'
-          memory: 256M
+    restart: unless-stopped
     environment:
       NODE_ENV: production
-      DATABASE_URL: postgresql://rootwars:rootwars_dev_password@postgres:5432/rootwars
+      ROLE: worker
+      HOME: /tmp
+      DATABASE_URL: postgresql://${POSTGRES_USER:-rootwars}:${POSTGRES_PASSWORD:?POSTGRES_PASSWORD must be set}@postgres:5432/${POSTGRES_DB:-rootwars}
       REDIS_URL: redis://redis:6379
-      LAB_SUBNET_PREFIX: '10.240'
+      SESSION_SECRET: ${SESSION_SECRET:?SESSION_SECRET must be set to a unique 32+ character value}
+      ALLOWED_ORIGINS: ${ALLOWED_ORIGINS:?ALLOWED_ORIGINS must list the exact browser origins}
+      # Dedicated lab daemon on the internal-only control network, never the host
+      # Docker socket. Enable TLS (docker:dind --tlsverify) for defence in depth.
+      LAB_DOCKER_HOST: ${LAB_DOCKER_HOST:-tcp://lab-dind:2375}
+      LAB_SCANNER_IMAGE: ${LAB_SCANNER_IMAGE:-rootwars/lab-scanner:1.0.0}
+      LAB_TARGET_IMAGE: ${LAB_TARGET_IMAGE:-rootwars/lab-target:1.0.0}
     depends_on:
       postgres:
         condition: service_healthy
+      redis:
+        condition: service_healthy
     networks:
       - app_net
-      - lab_internal_net
-
-  lab-target-sovereign:
-    build:
-      context: .
-      dockerfile: Dockerfile.worker
-    command: ['node', '-e', "require('net').createServer(s=>{s.write('SSH-2.0-OpenSSH_9.2p1 SovereignBank\\r\\n');s.end();}).listen(2222,'0.0.0.0')"]
-    user: '65534:65534'
-    read_only: true
-    cap_drop:
-      - ALL
+      - lab_control_net
+    # The worker runs as uid/gid 65534:65534 (set in Dockerfile.worker) with all
+    # capabilities dropped, no new privileges, a read-only root filesystem and a
+    # non-executable /tmp for scratch data.
     security_opt:
       - no-new-privileges:true
+    cap_drop:
+      - ALL
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=64m
+
+  # Dedicated Docker daemon that hosts ONLY disposable lab resources. It is
+  # reachable only from the lab worker over an internal network and is separate from
+  # any host Docker socket. Build/load the lab images into it with
+  # scripts/build-lab-images.sh before opening lab missions.
+  lab-dind:
+    image: docker:27.3.1-dind
+    restart: unless-stopped
+    privileged: true
+    command:
+      - --host=tcp://0.0.0.0:2375
+      - --tls=false
+    environment:
+      DOCKER_TLS_CERTDIR: ''
+    volumes:
+      - lab_dind_data:/var/lib/docker
+    networks:
+      - lab_control_net
     deploy:
       resources:
         limits:
-          cpus: '0.25'
-          memory: 128M
-    networks:
-      lab_internal_net:
-        ipv4_address: 10.240.10.10
+          cpus: '1.00'
+          memory: 1G
 
 networks:
   app_net:
     driver: bridge
-  lab_internal_net:
+  # Internal-only control network: the lab worker and lab daemon cannot reach the
+  # public internet or host services through it.
+  lab_control_net:
     driver: bridge
     internal: true
-    ipam:
-      config:
-        - subnet: 10.240.0.0/16
 
 volumes:
   pgdata:
+  lab_dind_data:

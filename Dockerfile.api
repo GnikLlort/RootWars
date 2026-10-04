@@ -7,6 +7,9 @@ RUN npm ci
 COPY . .
 RUN npm run build
 
+# The API container never receives a Docker socket, never runs as root, and serves
+# the compiled production server (no TypeScript dev tooling at runtime).
 USER node
 EXPOSE 3000
-CMD ["npm", "run", "dev:api"]
+ENV NODE_ENV=production
+CMD ["node", "dist/server/server/index.js"]

@@ -1,0 +1,16 @@
+# RootWars isolated lab scanner image.
+#
+# The nmap binary path inside this image is FIXED and verified at runtime by the
+# lab backend (`LAB_NMAP_PATH`, default /usr/bin/nmap). The image entrypoint is the
+# nmap binary itself, so the backend only ever appends allowlisted profile
+# arguments and the mission-assigned target address — never a shell string.
+FROM alpine:3.20
+
+RUN apk add --no-cache nmap nmap-scripts \
+    && rm -rf /var/cache/apk/* \
+    && /usr/bin/nmap --version
+
+# Unprivileged: connect scans (-sT) do not need elevated privileges.
+USER 65534:65534
+
+ENTRYPOINT ["/usr/bin/nmap"]

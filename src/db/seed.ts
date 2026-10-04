@@ -9,8 +9,27 @@ import {
   getUserAccountId
 } from '../server/services/ledger.js';
 
-export async function seedDatabase(db?: DatabaseAdapter): Promise<void> {
+export interface DemoSeedOptions {
+  /**
+   * Password for the local demo/rival operator accounts. It is always supplied by
+   * the caller (generated per run by the demo seed command or per test suite) so
+   * that no fixed, shared credential exists anywhere in the codebase.
+   */
+  password: string;
+}
+
+export interface SeedOptions {
+  /**
+   * Demo accounts, rival player nodes, groups, bounties and seed chat are only
+   * created when this option is explicitly provided by the development/demo seed
+   * command. Production startup never passes it.
+   */
+  demo?: DemoSeedOptions;
+}
+
+export async function seedDatabase(db?: DatabaseAdapter, options?: SeedOptions): Promise<void> {
   const database = db ?? (await getDb());
+  const demo = options?.demo;
   await runMigrations(database);
 
   // 1. System Mint Account
@@ -187,9 +206,21 @@ export async function seedDatabase(db?: DatabaseAdapter): Promise<void> {
     await ensureLedgerAccount(database, getFactionAccountId(f.id), 'faction', f.id, 500_000);
   }
 
-  // 4. Seed Rival/Demo Users so PvP, Groups, and Alliances have live entities immediately
-  const defaultPassHash = await hashPassword('RootWars!2026');
-  const seededUsers = [
+  // 4. Rival/Demo Users (OPT-IN ONLY — created solely by the demo seed command, never at startup)
+  const seededUsers: Array<{
+    id: string;
+    username: string;
+    role: string;
+    level: number;
+    xp: number;
+    reputation: number;
+    heat: number;
+    home_node_id: string;
+    balance: number;
+  }> = [];
+  if (demo) {
+    const defaultPassHash = await hashPassword(demo.password);
+    seededUsers.push(
     {
       id: 'usr-nyx-zero',
       username: 'nyx_zero',
@@ -234,16 +265,17 @@ export async function seedDatabase(db?: DatabaseAdapter): Promise<void> {
       home_node_id: 'node-pvp-cipher',
       balance: 5000
     }
-  ];
-
-  for (const u of seededUsers) {
-    await database.query(
-      `INSERT INTO users (id, username, password_hash, role, level, xp, reputation, heat, home_node_id, connected_node_id)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, 'node-infra-ixp')
-       ON CONFLICT (id) DO NOTHING`,
-      [u.id, u.username, defaultPassHash, u.role, u.level, u.xp, u.reputation, u.heat, u.home_node_id]
     );
-    await ensureLedgerAccount(database, getUserAccountId(u.id), 'user', u.id, u.balance);
+
+    for (const u of seededUsers) {
+      await database.query(
+        `INSERT INTO users (id, username, password_hash, role, level, xp, reputation, heat, home_node_id, connected_node_id)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, 'node-infra-ixp')
+         ON CONFLICT (id) DO NOTHING`,
+        [u.id, u.username, defaultPassHash, u.role, u.level, u.xp, u.reputation, u.heat, u.home_node_id]
+      );
+      await ensureLedgerAccount(database, getUserAccountId(u.id), 'user', u.id, u.balance);
+    }
   }
 
   // 5. Seed Network Nodes (24 in neo-cascadia + 3 in helvetia-haven = 27 total nodes)
@@ -930,7 +962,10 @@ export async function seedDatabase(db?: DatabaseAdapter): Promise<void> {
     }
   ];
 
-  for (const n of nodes) {
+  // Player-owned nodes belong to the opt-in demo fixtures and are inserted below.
+  const nodesToSeed = demo ? nodes : nodes.filter((n) => n.category !== 'player');
+
+  for (const n of nodesToSeed) {
     await database.query(
       `INSERT INTO network_nodes (
         id, region_id, faction_id, owner_user_id, owner_group_id,
@@ -964,19 +999,22 @@ export async function seedDatabase(db?: DatabaseAdapter): Promise<void> {
     );
   }
 
-  // Seed initial public discoveries for seeded users
-  for (const u of seededUsers) {
-    for (const n of nodes.filter((node) => node.is_public_entry)) {
-      await database.query(
-        `INSERT INTO player_node_discoveries (user_id, node_id, discovery_source, inspected)
-         VALUES ($1, $2, 'initial', FALSE)
-         ON CONFLICT (user_id, node_id) DO NOTHING`,
-        [u.id, n.id]
-      );
+  // Seed initial public discoveries for the opt-in demo operators
+  if (demo) {
+    for (const u of seededUsers) {
+      for (const n of nodes.filter((node) => node.is_public_entry)) {
+        await database.query(
+          `INSERT INTO player_node_discoveries (user_id, node_id, discovery_source, inspected)
+           VALUES ($1, $2, 'initial', FALSE)
+           ON CONFLICT (user_id, node_id) DO NOTHING`,
+          [u.id, n.id]
+        );
+      }
     }
   }
 
-  // 6. Seed Alliances, Groups, Group Members, Diplomacy, Bounties
+  // 6. Demo Alliances, Groups, Group Members, Diplomacy, Bounties (opt-in fixtures only)
+  if (demo) {
   await database.query(
     `INSERT INTO alliances (id, name, tag, description, founder_group_id, permissions_json)
      VALUES (
@@ -1061,6 +1099,8 @@ export async function seedDatabase(db?: DatabaseAdapter): Promise<void> {
        'open'
      ) ON CONFLICT (id) DO NOTHING`
   );
+
+  }
 
   // 7. Seed Missions (8 total: 5 Isolated Real-Nmap Lab Missions + 3 World Operations)
   const missions = [
@@ -1501,7 +1541,8 @@ export async function seedDatabase(db?: DatabaseAdapter): Promise<void> {
     }
   }
 
-  // 10. Seed Initial Incident History & Chat Messages
+  // 10. Seed Initial Incident History & Chat Messages (opt-in demo fixtures only)
+  if (demo) {
   await database.query(
     `INSERT INTO pvp_incidents (
       id, attacker_user_id, attacker_group_id, defender_user_id, defender_group_id,
@@ -1538,12 +1579,14 @@ export async function seedDatabase(db?: DatabaseAdapter): Promise<void> {
        ON CONFLICT (id) DO NOTHING`
     );
   }
+  }
 }
 
 if (import.meta.url === `file://${process.argv[1]}`) {
   seedDatabase()
     .then(async () => {
-      console.log('[RootWars Seed] Database seeded successfully.');
+      console.log('[RootWars Seed] World content seeded successfully (no demo accounts created).');
+      console.log('[RootWars Seed] For local demo operators run: npm run db:demo-seed');
       const db = await getDb();
       await db.close();
     })

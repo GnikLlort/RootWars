@@ -8,6 +8,8 @@ import fs from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { DatabaseAdapter, getDb } from '../db/index.js';
 import { RedisClients, getRedis } from '../db/redis.js';
+import { getConfig, type RootWarsConfig } from './config.js';
+import { RealtimeGateway } from './realtime.js';
 import {
   escapeTerminalText,
   generateId,
@@ -29,6 +31,8 @@ import { executeDefenseAction, executePvpOperation } from './services/pvp.js';
 import { generateDynamicWorldEvent, triggerFactionReaction } from './services/world-factions.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
+
+export const SESSION_COOKIE_NAME = 'rw_session';
 
 export interface AuthUser {
   id: string;
@@ -52,81 +56,143 @@ declare module 'fastify' {
   }
 }
 
+/**
+ * Explicit origin policy. Same-origin requests (matching Host), the configured
+ * ALLOWED_ORIGINS list, and — outside production only — localhost development
+ * origins are accepted. Everything else is rejected; there is no `origin: true` reflection.
+ */
+export function isAllowedOrigin(
+  origin: string | undefined,
+  host: string | undefined,
+  config: RootWarsConfig
+): boolean {
+  if (!origin) return true; // non-browser clients do not send Origin
+  let parsed: URL;
+  try {
+    parsed = new URL(origin);
+  } catch {
+    return false;
+  }
+  if (config.allowedOrigins.includes(origin) || config.allowedOrigins.includes(parsed.origin)) {
+    return true;
+  }
+  if (host && parsed.host === host) {
+    return true;
+  }
+  if (!config.isProduction && (parsed.hostname === 'localhost' || parsed.hostname === '127.0.0.1')) {
+    return true;
+  }
+  return false;
+}
+
 export async function buildApp(options?: {
   db?: DatabaseAdapter;
   redis?: RedisClients;
+  config?: RootWarsConfig;
 }): Promise<FastifyInstance> {
   const db = options?.db ?? (await getDb());
   const redis = options?.redis ?? (await getRedis());
+  const config = options?.config ?? getConfig();
 
   const app = Fastify({
     logger: false,
-    trustProxy: true
+    // Explicit trusted proxy configuration only. `true` (reflect any client-provided
+    // X-Forwarded-For) is refused by config validation in production because it lets
+    // users spoof their IP and bypass IP-based limits.
+    trustProxy: config.trustProxy
   });
 
   await app.register(fastifyCors, {
-    origin: true,
+    // Deny (rather than throw) for untrusted browser origins: the request is served
+    // without CORS headers so browsers block the response, while the WebSocket route
+    // performs its own explicit Origin check and closes rejected handshakes.
+    origin: (origin, cb) => {
+      cb(null, isAllowedOrigin(origin, undefined, config));
+    },
     credentials: true
   });
 
   await app.register(fastifyCookie, {
-    secret: process.env.SESSION_SECRET ?? 'rootwars-dev-secret-key-2026-32bytes'
+    secret: config.sessionSecret
   });
 
   await app.register(fastifyWebsocket);
 
-  // Connected WebSocket clients for realtime fanout
-  const wsClients = new Set<{
-    socket: any;
-    userId: string;
-    username: string;
-    groupId: string | null;
-    allianceId: string | null;
-  }>();
+  const realtime = new RealtimeGateway(db, redis, {
+    membershipCacheMs: Number(process.env.WS_MEMBERSHIP_CACHE_MS ?? 5000)
+  });
+  await realtime.start();
+  app.addHook('onClose', async () => {
+    await realtime.stop();
+  });
 
-  function broadcastRealtime(event: {
-    type: string;
-    channelType?: 'global' | 'group' | 'alliance' | 'user';
-    channelId?: string;
-    payload: any;
-  }) {
-    const serialized = JSON.stringify(event);
-    redis.pub.publish('rootwars:events', serialized).catch(() => {});
+  const cookieOptions = {
+    path: '/',
+    httpOnly: true,
+    sameSite: 'lax' as const,
+    secure: config.cookieSecure,
+    maxAge: config.sessionTtlSeconds
+  };
 
-    for (const client of wsClients) {
-      try {
-        if (event.channelType === 'group' && client.groupId !== event.channelId) continue;
-        if (event.channelType === 'alliance' && client.allianceId !== event.channelId) continue;
-        if (event.channelType === 'user' && client.userId !== event.channelId) continue;
-        if (client.socket.readyState === 1) {
-          client.socket.send(serialized);
-        }
-      } catch {}
-    }
+  interface RateLimitResult {
+    allowed: boolean;
+    backendError: boolean;
   }
 
-  // Rate limit helper backed by Redis
-  async function checkRateLimit(key: string, maxPerWindow: number, windowMs = 60_000): Promise<boolean> {
+  /**
+   * Redis-backed fixed-window rate limiter.
+   *
+   * When Redis errors, behaviour is explicit: `RATE_LIMIT_FAIL_MODE=closed`
+   * (the default) denies the request so authentication, command execution and chat
+   * limits can never be silently disabled. `open` exists only as a documented,
+   * non-production escape hatch.
+   */
+  async function checkRateLimit(key: string, maxPerWindow: number, windowMs = 60_000): Promise<RateLimitResult> {
     try {
       const redisKey = `rl:${key}`;
       const count = await redis.client.incr(redisKey);
       if (count === 1) {
         await redis.client.pexpire(redisKey, windowMs);
       }
-      return count <= maxPerWindow;
+      return { allowed: count <= maxPerWindow, backendError: false };
     } catch {
-      return true;
+      if (config.rateLimitFailMode === 'open') {
+        return { allowed: true, backendError: true };
+      }
+      return { allowed: false, backendError: true };
     }
   }
 
-  // Session resolution helper
+  async function enforceRateLimit(
+    reply: FastifyReply,
+    key: string,
+    maxPerWindow: number,
+    message: string
+  ): Promise<boolean> {
+    const result = await checkRateLimit(key, maxPerWindow);
+    if (result.allowed) return true;
+    if (result.backendError) {
+      reply.code(503).send({
+        error: 'RATE_LIMIT_BACKEND_UNAVAILABLE',
+        message: `${message} (rate limit backend unavailable; failing closed)`
+      });
+    } else {
+      reply.code(429).send({ error: 'RATE_LIMITED', message });
+    }
+    return false;
+  }
+
+  /**
+   * Session resolution. Tokens are accepted from the HttpOnly session cookie or an
+   * explicit Authorization header; they are never accepted from query strings
+   * (which leak into logs, proxies and referrers) and never returned in JSON.
+   */
   async function resolveSessionUser(req: FastifyRequest): Promise<AuthUser | null> {
     const authHeader = req.headers.authorization;
     const bearerToken = authHeader?.startsWith('Bearer ') ? authHeader.slice(7).trim() : undefined;
-    const cookieToken = req.cookies?.rw_session;
-    const queryToken = (req.query as any)?.token;
+    const cookieToken = (req.cookies as any)?.[SESSION_COOKIE_NAME];
 
-    const rawToken = bearerToken || cookieToken || queryToken;
+    const rawToken = cookieToken || bearerToken;
     if (!rawToken || typeof rawToken !== 'string') {
       return null;
     }
@@ -245,6 +311,7 @@ export async function buildApp(options?: {
       service: 'rootwars-api',
       dbBackend: db.backendType,
       redisBackend: redis.backendType,
+      instanceId: realtime.id,
       timestamp: new Date().toISOString()
     };
   });
@@ -253,10 +320,15 @@ export async function buildApp(options?: {
   // AUTH ROUTES
   // =========================================================================
   app.post('/api/auth/register', async (req, reply) => {
-    const authMax = Number(process.env.RATE_LIMIT_MAX_PER_MINUTE ?? 30);
-    const allowed = await checkRateLimit(`auth:${req.ip}`, authMax, 60_000);
-    if (!allowed) {
-      return reply.code(429).send({ error: 'RATE_LIMITED', message: 'Too many authentication attempts.' });
+    if (
+      !(await enforceRateLimit(
+        reply,
+        `auth:${req.ip}`,
+        config.rateLimits.authPerMinute,
+        'Too many authentication attempts.'
+      ))
+    ) {
+      return;
     }
 
     const body = (req.body as any) ?? {};
@@ -358,13 +430,18 @@ export async function buildApp(options?: {
       memo: 'New operator onboarding stipend (2,500 RWC)'
     });
 
-    // Create session
+    // Create session (HttpOnly cookie only; the raw token is never serialized in JSON)
     const { rawToken, tokenHash } = generateSessionToken();
-    const ttlSeconds = Number(process.env.SESSION_TTL_SECONDS ?? 86400);
     await db.query(
       `INSERT INTO sessions (id, user_id, ip_address, user_agent, expires_at)
        VALUES ($1, $2, $3, $4, NOW() + ($5 || ' seconds')::interval)`,
-      [tokenHash, userId, req.ip, req.headers['user-agent'] ?? '', String(ttlSeconds)]
+      [
+        tokenHash,
+        userId,
+        req.ip,
+        req.headers['user-agent'] ?? '',
+        String(config.sessionTtlSeconds)
+      ]
     );
 
     await redis.client.sadd('presence:online', username).catch(() => {});
@@ -375,25 +452,17 @@ export async function buildApp(options?: {
       [generateId('aud'), userId, req.ip, JSON.stringify({ username, homeNodeId })]
     );
 
-    reply.setCookie('rw_session', rawToken, {
-      path: '/',
-      httpOnly: true,
-      sameSite: 'lax',
-      maxAge: ttlSeconds
-    });
+    reply.setCookie(SESSION_COOKIE_NAME, rawToken, cookieOptions);
 
     const state = await buildFullOperatorState(userId);
-    return reply.code(201).send({
-      token: rawToken,
-      operator: state
-    });
+    return reply.code(201).send({ operator: state });
   });
 
   app.post('/api/auth/login', async (req, reply) => {
-    const authMax = Number(process.env.RATE_LIMIT_MAX_PER_MINUTE ?? 30);
-    const allowed = await checkRateLimit(`auth:${req.ip}`, authMax, 60_000);
-    if (!allowed) {
-      return reply.code(429).send({ error: 'RATE_LIMITED', message: 'Too many login attempts.' });
+    if (
+      !(await enforceRateLimit(reply, `auth:${req.ip}`, config.rateLimits.authPerMinute, 'Too many login attempts.'))
+    ) {
+      return;
     }
 
     const body = (req.body as any) ?? {};
@@ -414,11 +483,16 @@ export async function buildApp(options?: {
     }
 
     const { rawToken, tokenHash } = generateSessionToken();
-    const ttlSeconds = Number(process.env.SESSION_TTL_SECONDS ?? 86400);
     await db.query(
       `INSERT INTO sessions (id, user_id, ip_address, user_agent, expires_at)
        VALUES ($1, $2, $3, $4, NOW() + ($5 || ' seconds')::interval)`,
-      [tokenHash, user.id, req.ip, req.headers['user-agent'] ?? '', String(ttlSeconds)]
+      [
+        tokenHash,
+        user.id,
+        req.ip,
+        req.headers['user-agent'] ?? '',
+        String(config.sessionTtlSeconds)
+      ]
     );
 
     await db.query('UPDATE users SET last_seen_at = NOW() WHERE id = $1', [user.id]);
@@ -430,18 +504,10 @@ export async function buildApp(options?: {
       [generateId('aud'), user.id, req.ip, JSON.stringify({ username: user.username })]
     );
 
-    reply.setCookie('rw_session', rawToken, {
-      path: '/',
-      httpOnly: true,
-      sameSite: 'lax',
-      maxAge: ttlSeconds
-    });
+    reply.setCookie(SESSION_COOKIE_NAME, rawToken, cookieOptions);
 
     const state = await buildFullOperatorState(user.id);
-    return {
-      token: rawToken,
-      operator: state
-    };
+    return { operator: state };
   });
 
   app.post('/api/auth/logout', { preHandler: [requireAuth] }, async (req, reply) => {
@@ -451,7 +517,7 @@ export async function buildApp(options?: {
     if (req.authUser) {
       await redis.client.srem('presence:online', req.authUser.username).catch(() => {});
     }
-    reply.clearCookie('rw_session', { path: '/' });
+    reply.clearCookie(SESSION_COOKIE_NAME, { path: '/' });
     return { ok: true };
   });
 
@@ -465,15 +531,15 @@ export async function buildApp(options?: {
   // =========================================================================
   app.post('/api/terminal/exec', { preHandler: [requireAuth] }, async (req, reply) => {
     const userId = req.authUser!.id;
-    const maxCmdPerMin = Number(process.env.COMMAND_RATE_LIMIT_PER_MINUTE ?? 120);
-    const allowed = await checkRateLimit(`cmd:${userId}`, maxCmdPerMin, 60_000);
-    if (!allowed) {
-      return reply.code(429).send({
-        ok: false,
-        command: '',
-        category: 'error',
-        lines: ['[RATE_LIMIT] Terminal command rate exceeded. Wait before issuing further commands.']
-      });
+    if (
+      !(await enforceRateLimit(
+        reply,
+        `cmd:${userId}`,
+        config.rateLimits.commandPerMinute,
+        'Terminal command rate exceeded.'
+      ))
+    ) {
+      return;
     }
 
     const body = (req.body as any) ?? {};
@@ -483,7 +549,7 @@ export async function buildApp(options?: {
     const operator = await buildFullOperatorState(userId);
 
     if (output.missionCompleted) {
-      broadcastRealtime({
+      realtime.publish({
         type: 'mission_completed',
         channelType: 'global',
         payload: {
@@ -831,19 +897,24 @@ export async function buildApp(options?: {
     const body = (req.body as any) ?? {};
     const targetNodeId = String(body.targetNodeId ?? '');
     const method = (body.method ?? 'probe') as 'probe' | 'heist' | 'disrupt' | 'contest';
+    // Retries with the same idempotency key return the original incident result.
+    const idempotencyKey = String(body.idempotencyKey ?? body.requestId ?? generateId('pvp'));
 
     try {
       const result = await executePvpOperation(db, {
         attackerUserId: userId,
         targetNodeIdentifier: targetNodeId,
-        method
+        method,
+        requestId: idempotencyKey
       });
 
-      broadcastRealtime({
-        type: 'pvp_incident',
-        channelType: 'global',
-        payload: result
-      });
+      if (!result.idempotentReplay) {
+        realtime.publish({
+          type: 'pvp_incident',
+          channelType: 'global',
+          payload: result
+        });
+      }
 
       const operator = await buildFullOperatorState(userId);
       return { ok: true, result, operator };
@@ -1103,6 +1174,17 @@ export async function buildApp(options?: {
     const factionId = String(body.factionId ?? 'fac-aegis-gov');
     const action = String(body.action ?? 'negotiating') as any;
 
+    if (
+      !(await enforceRateLimit(
+        reply,
+        `faction:${userId}`,
+        config.rateLimits.factionInteractPerMinute,
+        'Faction interaction limit reached; slow down.'
+      ))
+    ) {
+      return;
+    }
+
     const reaction = await triggerFactionReaction(db, {
       factionId,
       triggerUserId: userId,
@@ -1114,7 +1196,7 @@ export async function buildApp(options?: {
       return reply.code(404).send({ error: 'FACTION_NOT_FOUND', message: 'Faction not found.' });
     }
 
-    broadcastRealtime({
+    realtime.publish({
       type: 'world_event',
       channelType: 'global',
       payload: reaction
@@ -1124,9 +1206,31 @@ export async function buildApp(options?: {
     return { ok: true, reaction, operator };
   });
 
-  app.post('/api/intel/world-event', { preHandler: [requireAuth] }, async () => {
+  /**
+   * Global world event generation is an administrative/worker capability.
+   * Player accounts receive 403; admins are rate limited. Normal world events are
+   * scheduled by the outbox worker (`world_event_tick`).
+   */
+  app.post('/api/intel/world-event', { preHandler: [requireAuth] }, async (req, reply) => {
+    if (req.authUser!.role !== 'admin') {
+      return reply.code(403).send({
+        error: 'FORBIDDEN',
+        message: 'Global world events are generated by world workers or admin operators only.'
+      });
+    }
+    if (
+      !(await enforceRateLimit(
+        reply,
+        `world-event:${req.authUser!.id}`,
+        config.rateLimits.worldEventPerMinute,
+        'World event rate limit reached.'
+      ))
+    ) {
+      return;
+    }
+
     const event = await generateDynamicWorldEvent(db);
-    broadcastRealtime({
+    realtime.publish({
       type: 'world_event',
       channelType: 'global',
       payload: event
@@ -1166,9 +1270,10 @@ export async function buildApp(options?: {
 
   app.post('/api/chat', { preHandler: [requireAuth] }, async (req, reply) => {
     const user = req.authUser!;
-    const allowed = await checkRateLimit(`chat:${user.id}`, 30, 60_000);
-    if (!allowed) {
-      return reply.code(429).send({ error: 'CHAT_RATE_LIMIT', message: 'Sending messages too quickly.' });
+    if (
+      !(await enforceRateLimit(reply, `chat:${user.id}`, config.rateLimits.chatPerMinute, 'Sending messages too quickly.'))
+    ) {
+      return;
     }
 
     const body = (req.body as any) ?? {};
@@ -1210,7 +1315,7 @@ export async function buildApp(options?: {
     );
 
     const chatRecord = inserted.rows[0];
-    broadcastRealtime({
+    realtime.publish({
       type: 'chat_message',
       channelType,
       channelId,
@@ -1220,31 +1325,27 @@ export async function buildApp(options?: {
     return { ok: true, message: chatRecord };
   });
 
-  // WebSocket Gateway
+  // WebSocket Gateway: authenticated from the session cookie handshake (no query
+  // string tokens) and origin-checked against the explicit allowlist.
   app.get('/ws', { websocket: true }, async (socket, req) => {
+    if (!isAllowedOrigin(req.headers.origin, req.headers.host, config)) {
+      socket.close(4003, 'Origin not allowed');
+      return;
+    }
+
     const user = await resolveSessionUser(req);
     if (!user) {
       socket.close(4001, 'Unauthorized');
       return;
     }
 
-    const gmRes = await db.query<{ group_id: string; alliance_id: string | null }>(
-      `SELECT gm.group_id, g.alliance_id
-       FROM group_members gm
-       JOIN groups g ON g.id = gm.group_id
-       WHERE gm.user_id = $1`,
-      [user.id]
-    );
-
     const clientEntry = {
       socket,
       userId: user.id,
-      username: user.username,
-      groupId: gmRes.rows[0]?.group_id ?? null,
-      allianceId: gmRes.rows[0]?.alliance_id ?? null
+      username: user.username
     };
 
-    wsClients.add(clientEntry);
+    realtime.addClient(clientEntry);
     await redis.client.sadd('presence:online', user.username).catch(() => {});
 
     socket.send(
@@ -1267,7 +1368,7 @@ export async function buildApp(options?: {
     });
 
     socket.on('close', () => {
-      wsClients.delete(clientEntry);
+      realtime.removeClient(clientEntry);
     });
   });
 

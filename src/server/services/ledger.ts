@@ -85,10 +85,7 @@ export async function getAccountBalance(db: DbClient, accountId: string): Promis
   return Number(res.rows[0].balance);
 }
 
-export async function executeLedgerTransfer(
-  db: DatabaseAdapter,
-  params: TransferParams
-): Promise<LedgerTransactionRecord> {
+function assertTransferParams(params: TransferParams): number {
   const amount = Math.floor(Number(params.amount));
   if (!Number.isFinite(amount) || amount <= 0) {
     throw new LedgerError('INVALID_AMOUNT', 'Transfer amount must be a positive integer.');
@@ -99,8 +96,33 @@ export async function executeLedgerTransfer(
   if (params.fromAccountId === params.toAccountId) {
     throw new LedgerError('SELF_TRANSFER', 'Cannot transfer to the same ledger account.');
   }
+  return amount;
+}
 
-  return await db.transaction(async (tx) => {
+export async function executeLedgerTransfer(
+  db: DatabaseAdapter,
+  params: TransferParams
+): Promise<LedgerTransactionRecord> {
+  assertTransferParams(params);
+  return await db.transaction(async (tx) => applyLedgerTransfer(tx, params));
+}
+
+/**
+ * Applies a ledger transfer inside a caller-owned transaction.
+ *
+ * Used by compound operations (for example atomic PvP attacks) that must commit
+ * currency movement together with node/incident state changes. The caller is
+ * responsible for having locked the involved accounts in a deterministic order
+ * before calling this function; account rows are locked here in lexicographical
+ * order as a second line of defence against deadlocks.
+ */
+export async function applyLedgerTransfer(
+  tx: DbClient,
+  params: TransferParams
+): Promise<LedgerTransactionRecord> {
+  const amount = assertTransferParams(params);
+
+  {
     const existing = await tx.query<any>(
       `SELECT * FROM ledger_transactions WHERE idempotency_key = $1`,
       [params.idempotencyKey]
@@ -191,5 +213,5 @@ export async function executeLedgerTransfer(
       amount: Number(row.amount),
       idempotentReplay: false
     };
-  });
+  }
 }

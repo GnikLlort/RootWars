@@ -117,11 +117,13 @@ const DEFAULT_WINDOWS: Record<
 };
 
 export const App: React.FC = () => {
-  const [token, setToken] = useState<string | null>(() => localStorage.getItem('rw_token'));
+  // Session tokens live only in the HttpOnly `rw_session` cookie; the browser app
+  // never stores or reads session tokens.
+  const [authed, setAuthed] = useState<boolean>(false);
   const [operator, setOperator] = useState<any | null>(null);
   const [authMode, setAuthMode] = useState<'login' | 'register'>('login');
-  const [usernameInput, setUsernameInput] = useState('cipher_wolf');
-  const [passwordInput, setPasswordInput] = useState('RootWars!2026');
+  const [usernameInput, setUsernameInput] = useState('');
+  const [passwordInput, setPasswordInput] = useState('');
   const [authError, setAuthError] = useState<string | null>(null);
   const [authLoading, setAuthLoading] = useState(false);
 
@@ -214,7 +216,6 @@ export const App: React.FC = () => {
     async (url: string, options: RequestInit = {}) => {
       const headers: Record<string, string> = {
         ...(options.body ? { 'Content-Type': 'application/json' } : {}),
-        ...(token ? { Authorization: `Bearer ${token}` } : {}),
         ...((options.headers as Record<string, string>) ?? {})
       };
       const res = await fetch(url, {
@@ -224,15 +225,16 @@ export const App: React.FC = () => {
       });
       const data = await res.json().catch(() => ({}));
       if (!res.ok) {
-        throw new Error(data.message || data.error || `HTTP ${res.status}`);
+        const error: any = new Error(data.message || data.error || `HTTP ${res.status}`);
+        error.status = res.status;
+        throw error;
       }
       return data;
     },
-    [token]
+    []
   );
 
   const refreshAllData = useCallback(async () => {
-    if (!token) return;
     try {
       const [meRes, mapRes, msnRes, socRes, ecoRes, intRes, chatRes] = await Promise.all([
         apiFetch('/api/auth/me'),
@@ -251,12 +253,12 @@ export const App: React.FC = () => {
       setIntelData(intRes);
       setChatMessages(chatRes.messages ?? []);
     } catch (err: any) {
-      if (String(err?.message).includes('Valid operator session')) {
-        setToken(null);
-        localStorage.removeItem('rw_token');
+      if (err?.status === 401) {
+        setAuthed(false);
+        setOperator(null);
       }
     }
-  }, [apiFetch, selectedRegion, token]);
+  }, [apiFetch, selectedRegion]);
 
   useEffect(() => {
     const t = setInterval(() => {
@@ -265,17 +267,39 @@ export const App: React.FC = () => {
     return () => clearInterval(t);
   }, []);
 
+  // Restore an existing cookie session on page load (the cookie is HttpOnly, so
+  // the browser cannot read it directly).
   useEffect(() => {
-    if (token) {
+    let cancelled = false;
+    (async () => {
+      try {
+        const meRes = await apiFetch('/api/auth/me');
+        if (!cancelled && meRes?.operator) {
+          setOperator(meRes.operator);
+          setAuthed(true);
+        }
+      } catch {
+        // No active session; stay on the login screen.
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [apiFetch]);
+
+  useEffect(() => {
+    if (authed) {
       refreshAllData();
     }
-  }, [token, selectedRegion, refreshAllData]);
+  }, [authed, selectedRegion, refreshAllData]);
 
   // WebSocket connection for live chat, alerts, PvP incidents, and world updates
   useEffect(() => {
-    if (!token) return;
+    if (!authed) return;
     const proto = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-    const wsUrl = `${proto}//${window.location.host}/ws?token=${encodeURIComponent(token)}`;
+    // The session is authenticated from the HttpOnly cookie during the WebSocket
+    // handshake; tokens are never placed in the URL.
+    const wsUrl = `${proto}//${window.location.host}/ws`;
     const ws = new WebSocket(wsUrl);
 
     ws.onmessage = (evt) => {
@@ -320,7 +344,7 @@ export const App: React.FC = () => {
       clearInterval(pingInterval);
       ws.close();
     };
-  }, [token, addNotification, refreshAllData]);
+  }, [authed, addNotification, refreshAllData]);
 
   useEffect(() => {
     termBottomRef.current?.scrollIntoView({ behavior: 'smooth' });
@@ -434,8 +458,7 @@ export const App: React.FC = () => {
           password: passwordInput
         })
       });
-      setToken(data.token);
-      localStorage.setItem('rw_token', data.token);
+      setAuthed(true);
       setOperator(data.operator);
     } catch (err: any) {
       setAuthError(err?.message ?? 'Authentication failed.');
@@ -448,8 +471,7 @@ export const App: React.FC = () => {
     try {
       await apiFetch('/api/auth/logout', { method: 'POST' });
     } catch {}
-    localStorage.removeItem('rw_token');
-    setToken(null);
+    setAuthed(false);
     setOperator(null);
   };
 
@@ -479,7 +501,7 @@ export const App: React.FC = () => {
   // =========================================================================
   // LOGIN / REGISTRATION SCREEN
   // =========================================================================
-  if (!token || !operator) {
+  if (!authed || !operator) {
     return (
       <div
         className="rw-desktop-wallpaper"
@@ -2389,16 +2411,26 @@ export const App: React.FC = () => {
                   </button>
                 ))}
               </div>
-              <button
-                type="button"
-                className="rw-btn"
-                onClick={async () => {
-                  await apiFetch('/api/intel/world-event', { method: 'POST' });
-                  await refreshAllData();
-                }}
-              >
-                <Zap size={12} /> Trigger Dynamic World Event
-              </button>
+              {operator?.role === 'admin' ? (
+                <button
+                  type="button"
+                  className="rw-btn"
+                  onClick={async () => {
+                    try {
+                      await apiFetch('/api/intel/world-event', { method: 'POST' });
+                      await refreshAllData();
+                    } catch (err: any) {
+                      addNotification('World Event Denied', err?.message ?? 'Not permitted', 'warn');
+                    }
+                  }}
+                >
+                  <Zap size={12} /> Trigger Dynamic World Event (admin)
+                </button>
+              ) : (
+                <span style={{ fontSize: '11px', color: '#64748b', alignSelf: 'center' }}>
+                  World events are generated by world workers
+                </span>
+              )}
             </div>
 
             <div style={{ flex: 1, padding: '14px', overflowY: 'auto' }}>
@@ -2594,11 +2626,11 @@ export const App: React.FC = () => {
                 LAB ISOLATION & SAFETY ARCHITECTURE
               </div>
               <p style={{ margin: 0, color: '#cbd5e1', lineHeight: 1.5 }}>
-                RootWars executes real <code>nmap</code> strictly inside short-lived, disposable Linux network
-                namespaces (<code>ip netns</code>) as unprivileged <code>uid=65534(nobody)</code> with{' '}
-                <code>--no-new-privs</code> and <code>prlimit</code> memory/CPU caps. The isolated namespace has
-                zero default route and zero access to the public internet or host loopback services. Only the
-                assigned <code>10.240.x.x</code> mission replica IP is reachable.
+                RootWars executes real <code>nmap</code> only in short-lived, disposable Docker containers on a
+                mission-specific internal lab network as unprivileged <code>uid=65534(nobody)</code> with{' '}
+                <code>--cap-drop ALL</code>, <code>--no-new-privileges</code> and memory/CPU/process caps. The lab
+                network has no route to the public internet or the host, and the scanner can only reach the single
+                <code>10.240.x.x</code> target assigned to the active mission.
               </p>
             </div>
 

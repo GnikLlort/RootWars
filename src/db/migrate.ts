@@ -4,7 +4,31 @@ import { fileURLToPath } from 'node:url';
 import { DatabaseAdapter, getDb } from './index.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
-const MIGRATIONS_DIR = path.resolve(__dirname, '../../migrations');
+
+/**
+ * Migrations are resolved at runtime so the same code works from source
+ * (`src/db` during `tsx` dev/test) and from the compiled production build
+ * (`dist/server/db` inside the API image). Before this, the compiled server
+ * looked for `dist/migrations` and crashed on startup in production.
+ */
+export function candidateMigrationsDirs(fromDir: string): string[] {
+  return [
+    process.env.MIGRATIONS_DIR?.trim() || undefined,
+    path.resolve(process.cwd(), 'migrations'),
+    path.resolve(fromDir, '../../migrations'),
+    path.resolve(fromDir, '../../../migrations')
+  ].filter((dir): dir is string => Boolean(dir));
+}
+
+export function resolveMigrationsDir(fromDir: string = __dirname): string {
+  for (const dir of candidateMigrationsDirs(fromDir)) {
+    if (fs.existsSync(dir)) return dir;
+  }
+  throw new Error(
+    `Unable to locate the RootWars migrations directory (tried: ${candidateMigrationsDirs(fromDir).join(', ')}). ` +
+      'Set MIGRATIONS_DIR or run the server from the repository/container root.'
+  );
+}
 
 export async function runMigrations(db?: DatabaseAdapter): Promise<string[]> {
   const database = db ?? (await getDb());
@@ -15,8 +39,9 @@ export async function runMigrations(db?: DatabaseAdapter): Promise<string[]> {
     );
   `);
 
+  const migrationsDir = resolveMigrationsDir();
   const files = fs
-    .readdirSync(MIGRATIONS_DIR)
+    .readdirSync(migrationsDir)
     .filter((f) => f.endsWith('.sql'))
     .sort();
 
@@ -31,7 +56,7 @@ export async function runMigrations(db?: DatabaseAdapter): Promise<string[]> {
       continue;
     }
 
-    const sql = fs.readFileSync(path.join(MIGRATIONS_DIR, file), 'utf-8');
+    const sql = fs.readFileSync(path.join(migrationsDir, file), 'utf-8');
     await database.execSql(sql);
     await database.query('INSERT INTO schema_migrations (version) VALUES ($1)', [file]);
     applied.push(file);
